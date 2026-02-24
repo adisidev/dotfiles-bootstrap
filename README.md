@@ -26,6 +26,9 @@ INSTALL_PRIVATE=true
 # skip secondary protected repo sync
 SKIP_PROTECTED=true
 
+# make brew bundle failures fatal
+BREW_BUNDLE_REQUIRED=true
+
 # override target repo/path
 DOTFILES_REPO="yourname/dotfiles"
 DOTFILES_DIR="$HOME/github/dotfiles"
