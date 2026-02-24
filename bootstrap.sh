@@ -7,6 +7,8 @@ PROTECTED_DOTFILES_REPO="${PROTECTED_DOTFILES_REPO:-}"
 SKIP_PROTECTED="${SKIP_PROTECTED:-false}"
 INSTALL_PRIVATE="${INSTALL_PRIVATE:-ask}"
 BREW_BUNDLE_REQUIRED="${BREW_BUNDLE_REQUIRED:-false}"
+SET_HOSTNAME="${SET_HOSTNAME:-ask}"
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
 
 log() {
   printf "[bootstrap] %s\n" "$*"
@@ -131,6 +133,15 @@ ensure_gh_auth() {
   gh auth login --hostname github.com --git-protocol https --web
 }
 
+configure_git_with_gh_auth() {
+  if gh auth setup-git >/dev/null 2>&1; then
+    log "Configured git to use GitHub CLI auth."
+    return
+  fi
+
+  log "Could not configure git with GitHub CLI auth automatically."
+}
+
 clone_or_update_dotfiles_repo() {
   mkdir -p "$(dirname "$DOTFILES_DIR")"
 
@@ -154,6 +165,7 @@ main() {
 
   resolve_install_private_preference
   ensure_gh_auth
+  configure_git_with_gh_auth
   clone_or_update_dotfiles_repo
 
   local setup_script="$DOTFILES_DIR/setup.sh"
@@ -168,6 +180,8 @@ main() {
     SKIP_PROTECTED="$SKIP_PROTECTED" \
     INSTALL_PRIVATE="$INSTALL_PRIVATE" \
     BREW_BUNDLE_REQUIRED="$BREW_BUNDLE_REQUIRED" \
+    SET_HOSTNAME="$SET_HOSTNAME" \
+    TARGET_HOSTNAME="$TARGET_HOSTNAME" \
     bash "$setup_script"
 }
 
