@@ -27,7 +27,23 @@ ensure_brew_shellenv() {
 install_homebrew_if_missing() {
   if have_cmd brew; then ensure_brew_shellenv; return; fi
   log "Installing Homebrew..."
+  log "(prompting for sudo password — needed to chown /opt/homebrew on first install)"
+  # NONINTERACTIVE=1 makes Homebrew skip prompts AND skip sudo-credential
+  # bootstrap, so we cache them ourselves first. sudo reads from /dev/tty
+  # by default, so this works under curl|bash too.
+  if ! sudo -v; then
+    log "Could not cache sudo credentials. Run 'sudo -v' yourself, then re-run bootstrap."
+    exit 1
+  fi
+  # Keep sudo credentials alive in the background until Homebrew install finishes.
+  ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null &
+  local sudo_keep_pid=$!
+  trap 'kill "$sudo_keep_pid" 2>/dev/null || true' EXIT
+
   NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  kill "$sudo_keep_pid" 2>/dev/null || true
+  trap - EXIT
   ensure_brew_shellenv
 }
 
