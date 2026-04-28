@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
+# Bootstrap a new machine: install prereqs, bare-clone dotfiles into $HOME,
+# then hand off to the setup script in ~/dotfiles/setup.sh.
+#
+# Usage: curl -fsSL bootstrap.adi.zip | bash
+
 set -euo pipefail
 
 DOTFILES_REPO="${DOTFILES_REPO:-adisidev/dotfiles}"
-DOTFILES_DIR="${DOTFILES_DIR:-$HOME/github/dotfiles}"
-PROTECTED_DOTFILES_REPO="${PROTECTED_DOTFILES_REPO:-}"
-SKIP_PROTECTED="${SKIP_PROTECTED:-false}"
-INSTALL_PRIVATE="${INSTALL_PRIVATE:-ask}"
-BREW_BUNDLE_REQUIRED="${BREW_BUNDLE_REQUIRED:-false}"
-SET_HOSTNAME="${SET_HOSTNAME:-ask}"
-TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
+DOTFILES_GIT_DIR="${DOTFILES_GIT_DIR:-$HOME/.local/share/dotfiles.git}"
+SETUP_DIR="${SETUP_DIR:-$HOME/dotfiles}"
+BACKUP_ROOT="${BACKUP_ROOT:-$HOME/.dotfiles-bootstrap-conflicts}"
 
 log() {
   printf "[bootstrap] %s\n" "$*"
@@ -16,10 +17,6 @@ log() {
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
-}
-
-brew_formula_installed() {
-  brew list --formula "$1" >/dev/null 2>&1
 }
 
 ensure_brew_shellenv() {
@@ -37,7 +34,6 @@ install_homebrew_if_missing() {
     ensure_brew_shellenv
     return
   fi
-
   log "Installing Homebrew..."
   NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   ensure_brew_shellenv
@@ -45,144 +41,96 @@ install_homebrew_if_missing() {
 
 install_formula_if_missing() {
   local pkg="$1"
-  if ! brew_formula_installed "$pkg"; then
-    log "Installing formula: $pkg"
+  if ! brew list --formula "$pkg" >/dev/null 2>&1; then
+    log "Installing $pkg"
     brew install "$pkg"
   fi
-}
-
-normalize_install_private() {
-  local value="${1:-ask}"
-  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-
-  case "$value" in
-    yes|y|true|1)
-      printf "true"
-      ;;
-    no|n|false|0)
-      printf "false"
-      ;;
-    ask|"")
-      printf "ask"
-      ;;
-    *)
-      printf "invalid"
-      ;;
-  esac
-}
-
-prompt_yes_no_default_no() {
-  local prompt="$1"
-  local answer
-
-  if [[ ! -r /dev/tty ]]; then
-    return 1
-  fi
-
-  while true; do
-    printf "%s [y/N]: " "$prompt" > /dev/tty
-    if ! IFS= read -r answer < /dev/tty; then
-      return 1
-    fi
-
-    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
-    case "$answer" in
-      y|yes)
-        printf "true"
-        return
-        ;;
-      n|no|"")
-        printf "false"
-        return
-        ;;
-    esac
-
-    printf "Please answer y or n.\n" > /dev/tty
-  done
-}
-
-resolve_install_private_preference() {
-  local normalized
-  normalized="$(normalize_install_private "$INSTALL_PRIVATE")"
-
-  if [[ "$normalized" == "invalid" ]]; then
-    log "Invalid INSTALL_PRIVATE value '$INSTALL_PRIVATE'. Falling back to interactive prompt."
-    normalized="ask"
-  fi
-
-  if [[ "$normalized" == "ask" ]]; then
-    if INSTALL_PRIVATE="$(prompt_yes_no_default_no "Install private/secret dotfiles content when detected?")"; then
-      :
-    else
-      INSTALL_PRIVATE="false"
-      log "Could not prompt interactively; defaulting private/secret install to 'no'."
-    fi
-  else
-    INSTALL_PRIVATE="$normalized"
-  fi
-
-  log "Private/secret content enabled: $INSTALL_PRIVATE"
 }
 
 ensure_gh_auth() {
   if gh auth status >/dev/null 2>&1; then
     return
   fi
-
   log "GitHub CLI is not authenticated. Starting login flow..."
   gh auth login --hostname github.com --git-protocol https --web
+  gh auth setup-git >/dev/null 2>&1 || log "Could not configure git with gh auth automatically."
 }
 
-configure_git_with_gh_auth() {
-  if gh auth setup-git >/dev/null 2>&1; then
-    log "Configured git to use GitHub CLI auth."
+# Wrapper: every git op against the bare dotfiles repo.
+df_git() {
+  git --git-dir="$DOTFILES_GIT_DIR" --work-tree="$HOME" "$@"
+}
+
+bare_clone_dotfiles() {
+  if [[ -d "$DOTFILES_GIT_DIR" ]]; then
+    log "Bare repo already exists at $DOTFILES_GIT_DIR; fetching latest."
+    df_git fetch origin
     return
   fi
 
-  log "Could not configure git with GitHub CLI auth automatically."
+  log "Bare-cloning $DOTFILES_REPO into $DOTFILES_GIT_DIR"
+  git clone --bare "https://github.com/$DOTFILES_REPO.git" "$DOTFILES_GIT_DIR"
+
+  # Quiet status: $HOME has thousands of untracked files; we only want
+  # tracked/modified noise.
+  df_git config status.showUntrackedFiles no
+
+  # Make `git ls-files` and friends work the same as a regular repo.
+  df_git config core.bare false
 }
 
-clone_or_update_dotfiles_repo() {
-  mkdir -p "$(dirname "$DOTFILES_DIR")"
-
-  if [[ -d "$DOTFILES_DIR/.git" ]]; then
-    log "Updating dotfiles at $DOTFILES_DIR"
-    if ! git -C "$DOTFILES_DIR" pull --ff-only; then
-      log "Could not fast-forward $DOTFILES_DIR; continuing with current checkout."
-    fi
+# Move any pre-existing files in $HOME that would conflict with checkout
+# into a backup directory, so checkout can proceed cleanly.
+backup_conflicts() {
+  local conflicts
+  conflicts="$(df_git checkout 2>&1 | sed -n 's/^	//p' | grep -v '^$' || true)"
+  if [[ -z "$conflicts" ]]; then
     return
   fi
 
-  log "Cloning dotfiles repo to $DOTFILES_DIR"
-  gh repo clone "$DOTFILES_REPO" "$DOTFILES_DIR"
+  local stamp="$(date +%Y%m%d-%H%M%S)"
+  local dest="$BACKUP_ROOT/$stamp"
+  mkdir -p "$dest"
+  log "Moving $(echo "$conflicts" | wc -l | tr -d ' ') conflicting files to $dest"
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    mkdir -p "$dest/$(dirname "$f")"
+    mv "$HOME/$f" "$dest/$f"
+  done <<< "$conflicts"
+}
+
+checkout_dotfiles() {
+  if ! df_git checkout 2>/dev/null; then
+    log "Initial checkout had conflicts — backing them up and retrying."
+    backup_conflicts
+    df_git checkout
+  fi
+
+  # Bring up the server submodule (others are phantom and skipped).
+  df_git -c submodule.server.update=checkout submodule update --init dotfiles/server 2>/dev/null || true
 }
 
 main() {
   install_homebrew_if_missing
-
   install_formula_if_missing git
   install_formula_if_missing gh
 
-  resolve_install_private_preference
   ensure_gh_auth
-  configure_git_with_gh_auth
-  clone_or_update_dotfiles_repo
+  bare_clone_dotfiles
+  checkout_dotfiles
 
-  local setup_script="$DOTFILES_DIR/setup.sh"
-  if [[ ! -f "$setup_script" ]]; then
-    log "Missing setup script: $setup_script"
-    exit 1
+  local setup_script="$SETUP_DIR/setup.sh"
+  if [[ -x "$setup_script" ]]; then
+    log "Running setup script: $setup_script"
+    DOTFILES_GIT_DIR="$DOTFILES_GIT_DIR" SETUP_DIR="$SETUP_DIR" bash "$setup_script"
+  else
+    log "Setup script not found or not executable at $setup_script — skipping."
+    log "Once you've airdropped your secrets and run $setup_script manually, you're done."
   fi
 
-  DOTFILES_REPO="$DOTFILES_REPO" \
-    DOTFILES_DIR="$DOTFILES_DIR" \
-    PROTECTED_DOTFILES_REPO="$PROTECTED_DOTFILES_REPO" \
-    SKIP_PROTECTED="$SKIP_PROTECTED" \
-    INSTALL_PRIVATE="$INSTALL_PRIVATE" \
-    BREW_BUNDLE_REQUIRED="$BREW_BUNDLE_REQUIRED" \
-    SET_HOSTNAME="$SET_HOSTNAME" \
-    TARGET_HOSTNAME="$TARGET_HOSTNAME" \
-    bash "$setup_script"
+  log "Bootstrap complete. Use the 'dotfiles' alias for git operations:"
+  log "  source ~/.aliases   # or open a new shell"
+  log "  dotfiles status"
 }
 
 main "$@"
