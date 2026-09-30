@@ -56,9 +56,12 @@ install_formula_if_missing() {
 }
 
 ensure_gh_auth() {
-  if gh auth status >/dev/null 2>&1; then return; fi
-  log "GitHub CLI not authenticated — starting login flow..."
-  gh auth login --hostname github.com --git-protocol https --web
+  if ! gh auth status >/dev/null 2>&1; then
+    log "GitHub CLI not authenticated — starting login flow..."
+    gh auth login --hostname github.com --git-protocol https --web
+  fi
+  # Always, not only after a fresh login: git needs gh as its credential helper to fetch the private dotfiles,
+  # including when gh was already logged in (or GH_TOKEN is set) before this ran.
   gh auth setup-git >/dev/null 2>&1 || log "(could not configure git with gh auth automatically)"
 }
 
